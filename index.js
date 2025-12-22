@@ -4,23 +4,13 @@ const { chromium } = require('playwright');
 const app = express();
 app.use(express.json());
 
-// Healthcheck
 app.get('/', (_req, res) => res.send('OK'));
 
-/**
- * POST /check-variants
- * Body:
- * {
- *   "product_url": "https://....",
- *   "max_combos": 250,   // opcional
- *   "max_ms": 60000      // opcional
- * }
- */
 app.post('/check-variants', async (req, res) => {
   const product_url = String(req.body?.product_url ?? '').trim();
   if (!product_url) return res.status(400).json({ error: 'product_url requerido' });
 
-  const MAX_COMBOS = Number.isFinite(Number(req.body?.max_combos)) ? Number(req.body.max_combos) : 250;
+  const MAX_COMBOS = Number.isFinite(Number(req.body?.max_combos)) ? Number(req.body.max_combos) : 300;
   const MAX_MS = Number.isFinite(Number(req.body?.max_ms)) ? Number(req.body.max_ms) : 60000;
 
   let browser;
@@ -33,43 +23,122 @@ app.post('/check-variants', async (req, res) => {
     });
 
     const page = await browser.newPage();
+    await page.goto(product_url, { waitUntil: 'networkidle', timeout: 45000 });
+    await page.waitForTimeout(800);
 
-    await page.goto(product_url, { waitUntil: 'networkidle', timeout: 30000 });
+    // --- helpers dentro de la página ---
+    const getVisibleOptions = async () => {
+      return await page.evaluate(() => {
+        const isVisible = (el) => {
+          if (!el) return false;
+          const st = window.getComputedStyle(el);
+          if (!st) return false;
+          if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+          // offsetParent null suele significar hidden (excepto position:fixed)
+          if (el.offsetParent === null && st.position !== 'fixed') return false;
+          return true;
+        };
 
-    // Esperar que el DOM esté listo (aunque los selects estén hidden)
-    await page.waitForTimeout(500);
+        const pick = (cls) => {
+          const all = Array.from(document.querySelectorAll(`a.js-insta-variant.${cls}`))
+            .filter(isVisible);
 
-    // Helper: elegir el "mejor" select entre muchos duplicados (TiendaNube suele duplicar)
-    const getBestSelectOptions = async (name) => {
-      return await page.evaluate((name) => {
-        const selects = Array.from(document.querySelectorAll(`select[name="${name}"]`));
+          // dedupe por data-option (hay duplicados)
+          const seen = new Set();
+          const out = [];
+          for (const a of all) {
+            const opt = a.getAttribute('data-option') || '';
+            if (!opt || seen.has(opt)) continue;
+            seen.add(opt);
+            out.push({
+              option: opt,
+              label: (a.textContent || '').trim() || opt,
+            });
+          }
+          return out;
+        };
 
-        function score(sel) {
-          const optCount = sel.querySelectorAll('option').length;
-          const form = sel.closest('form');
-          const hasSubmit = !!(form && form.querySelector('button[type="submit"]'));
-          // prioriza el que está en un form con submit y con más options reales
-          return (hasSubmit ? 1000 : 0) + optCount;
-        }
-
-        const best = selects
-          .map(sel => ({ sel, s: score(sel) }))
-          .sort((a, b) => b.s - a.s)[0]?.sel;
-
-        if (!best) return [];
-
-        return Array.from(best.querySelectorAll('option'))
-          .map(o => ({
-            value: o.value,
-            label: (o.textContent || '').trim(),
-            disabled: !!o.disabled,
-          }))
-          .filter(o => o.label && !o.label.toLowerCase().includes('seleccion'));
-      }, name);
+        return {
+          talles: pick('Talle'),
+          colores: pick('Color'),
+        };
+      });
     };
 
-    const talles = await getBestSelectOptions('variation[0]');
-    const colores = await getBestSelectOptions('variation[1]');
+    const clickOption = async (cls, option) => {
+      return await page.evaluate(({ cls, option }) => {
+        const isVisible = (el) => {
+          const st = window.getComputedStyle(el);
+          if (!st) return false;
+          if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+          if (el.offsetParent === null && st.position !== 'fixed') return false;
+          return true;
+        };
+
+        const candidates = Array.from(document.querySelectorAll(`a.js-insta-variant.${cls}`))
+          .filter(isVisible);
+
+        const el = candidates.find(a => (a.getAttribute('data-option') || '') === option);
+
+        if (!el) return { ok: false, reason: 'not_found' };
+
+        el.click();
+        return { ok: true };
+      }, { cls, option });
+    };
+
+    const getAvailability = async (talleOption, colorOption) => {
+      return await page.evaluate(({ talleOption, colorOption }) => {
+        const isVisible = (el) => {
+          const st = window.getComputedStyle(el);
+          if (!st) return false;
+          if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+          if (el.offsetParent === null && st.position !== 'fixed') return false;
+          return true;
+        };
+
+        const findVisibleChip = (cls, option) => {
+          const candidates = Array.from(document.querySelectorAll(`a.js-insta-variant.${cls}`))
+            .filter(isVisible);
+          return candidates.find(a => (a.getAttribute('data-option') || '') === option) || null;
+        };
+
+        const talleEl = findVisibleChip('Talle', talleOption);
+        const colorEl = findVisibleChip('Color', colorOption);
+
+        // 1) chip con clase de no stock (rayita)
+        const chipNoStock =
+          (talleEl && talleEl.classList.contains('btn-variant-no-stock')) ||
+          (colorEl && colorEl.classList.contains('btn-variant-no-stock'));
+
+        // 2) CTA real de esta tienda: input.product-buy-btn ... disabled ... class nostock ... value "Sin stock"
+        const submit =
+          document.querySelector('input.product-buy-btn[type="submit"]') ||
+          document.querySelector('form input[type="submit"]') ||
+          document.querySelector('form button[type="submit"]') ||
+          document.querySelector('button[type="submit"]');
+
+        const submitDisabled = submit ? !!submit.disabled : true; // si no hay submit, asumí no disponible
+        const submitClass = submit ? (submit.className || '').toLowerCase() : '';
+        const submitValue = submit
+          ? (submit.tagName === 'INPUT' ? (submit.getAttribute('value') || '') : (submit.textContent || ''))
+          : '';
+
+        const submitNoStock =
+          submitDisabled ||
+          submitClass.includes('nostock') ||
+          submitValue.toLowerCase().includes('sin stock');
+
+        // Regla final
+        if (chipNoStock) return false;
+        if (submitNoStock) return false;
+
+        return true;
+      }, { talleOption, colorOption });
+    };
+
+    // --- tomar opciones desde chips visibles ---
+    const { talles, colores } = await getVisibleOptions();
 
     if (!talles.length || !colores.length) {
       return res.status(200).json({
@@ -79,53 +148,32 @@ app.post('/check-variants', async (req, res) => {
         tallesCount: talles.length,
         coloresCount: colores.length,
         limited: false,
-        note: 'No se encontraron 2 selects variation[0] y variation[1]. Puede ser que el producto no tenga esas 2 variaciones o el template use otro name.',
+        note: 'No encontré chips visibles de Talle/Color (a.js-insta-variant).',
       });
     }
-
-    // Helper: setear select por VALUE y disparar change (aunque esté hidden)
-    const setVariationValue = async (name, value) => {
-      await page.evaluate(({ name, value }) => {
-        const selects = Array.from(document.querySelectorAll(`select[name="${name}"]`));
-
-        function score(sel) {
-          const optCount = sel.querySelectorAll('option').length;
-          const form = sel.closest('form');
-          const hasSubmit = !!(form && form.querySelector('button[type="submit"]'));
-          return (hasSubmit ? 1000 : 0) + optCount;
-        }
-
-        const sel = selects
-          .map(s => ({ s, sc: score(s) }))
-          .sort((a, b) => b.sc - a.sc)[0]?.s;
-
-        if (!sel) return;
-
-        sel.value = value;
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
-      }, { name, value });
-    };
 
     const combos = [];
     let count = 0;
 
     for (const t of talles) {
       if (Date.now() - started > MAX_MS) break;
+      if (count >= MAX_COMBOS) break;
 
-      await setVariationValue('variation[0]', t.value);
-      await page.waitForTimeout(150);
+      const ct = await clickOption('Talle', t.option);
+      if (!ct.ok) continue;
+
+      await page.waitForTimeout(250);
 
       for (const c of colores) {
         if (Date.now() - started > MAX_MS) break;
         if (count >= MAX_COMBOS) break;
 
-        await setVariationValue('variation[1]', c.value);
-        await page.waitForTimeout(200);
+        const cc = await clickOption('Color', c.option);
+        if (!cc.ok) continue;
 
-        const available = await page.evaluate(() => {
-          const btn = document.querySelector('form button[type="submit"], button[type="submit"]');
-          return btn ? !btn.disabled : false;
-        });
+        await page.waitForTimeout(250);
+
+        const available = await getAvailability(t.option, c.option);
 
         combos.push({
           talle: t.label,
@@ -135,8 +183,6 @@ app.post('/check-variants', async (req, res) => {
 
         count++;
       }
-
-      if (count >= MAX_COMBOS) break;
     }
 
     const limited = (count >= MAX_COMBOS) || (Date.now() - started > MAX_MS);
@@ -154,7 +200,6 @@ app.post('/check-variants', async (req, res) => {
     });
 
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: err.message, elapsed_ms: Date.now() - started });
   } finally {
     if (browser) await browser.close();
