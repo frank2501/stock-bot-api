@@ -4,12 +4,6 @@ import { chromium } from "playwright";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ====== QUEUE GLOBAL (1 request a la vez, sin locks que se traben) ======
-let queue = Promise.resolve();
-let queued = 0;
-let running = false;
-
-// ====== UTILS ======
 function nowMs() {
   return Date.now();
 }
@@ -21,24 +15,13 @@ function normalizeText(s) {
 }
 
 function colorFromUrl(product_url) {
-  // ej: /productos/art-4315-malbec/ -> "malbec"
   const slug = (product_url.split("/productos/")[1] || "").split("/")[0] || "";
   const parts = slug.split("-");
   if (parts.length < 2) return "";
   return parts[parts.length - 1].replace(/_/g, " ").trim();
 }
 
-function withTimeout(promise, ms, label = "timeout") {
-  let t;
-  const timeout = new Promise((_, reject) => {
-    t = setTimeout(() => reject(new Error(`${label} after ${ms}ms`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
-}
-
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, running, queued });
-});
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.post("/check-variants", async (req, res) => {
   const started = nowMs();
@@ -47,58 +30,100 @@ app.post("/check-variants", async (req, res) => {
   const max_combos = Number(req.body?.max_combos ?? 200);
   const max_ms = Number(req.body?.max_ms ?? 20000);
 
-  if (!product_url) {
+  if (!product_url)
     return res.status(400).json({ error: "product_url requerido" });
-  }
 
-  // ---- JOB real (tu lógica de Playwright) ----
-  const job = async () => {
-    let browser;
-    let context;
-    let page;
+  const jobStarted = nowMs();
+  const deadline = jobStarted + max_ms;
 
-    try {
-      browser = await chromium.launch({
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu",
-        ],
-      });
+  let browser, context, page;
 
-      context = await browser.newContext({
-        viewport: { width: 1280, height: 800 },
-        userAgent:
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      });
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+      ],
+    });
 
-      page = await context.newPage();
+    context = await browser.newContext({
+      viewport: { width: 1280, height: 800 },
+      userAgent:
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+      serviceWorkers: "block",
+      extraHTTPHeaders: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+    });
 
-      // timeout por step (igual cortamos con max_ms)
-      page.setDefaultTimeout(Math.min(15000, max_ms));
+    page = await context.newPage();
+    page.setDefaultTimeout(Math.min(20000, Math.max(5000, max_ms)));
 
-      await page.goto(product_url, { waitUntil: "domcontentloaded" });
+    await page.goto(product_url, { waitUntil: "networkidle" });
+    await page.waitForSelector(
+      'h1, [data-store="product-name"], [data-component="product.add-to-cart"]',
+      { timeout: Math.min(20000, Math.max(5000, max_ms)) }
+    );
 
-      // ===== 1) Descubrir “variations” del DOM =====
-      const variations = await page.evaluate(() => {
+    const fallbackColor = colorFromUrl(product_url);
+
+    // ====== ROOT DEL PRODUCTO PRINCIPAL (evita mezclar con recomendados) ======
+    const rootInfo = await page.evaluate(() => {
+      function pickRoot() {
+        const btn =
+          document.querySelector('[data-component="product.add-to-cart"]') ||
+          document.querySelector("input.product-buy-btn") ||
+          document.querySelector("button.product-buy-btn");
+
+        if (btn) {
+          const form = btn.closest("form");
+          if (form) return { mode: "form", ok: true };
+          const wrap = btn.closest(
+            ".product-form, .js-product-form, .product-detail, .product-container"
+          );
+          if (wrap) return { mode: "wrap", ok: true };
+        }
+        return { mode: "document", ok: false };
+      }
+      return pickRoot();
+    });
+
+    // ===== 1) Descubrir variaciones SOLO dentro del root =====
+    const variations = await page.evaluate(
+      ({ rootInfo }) => {
         function norm(s) {
           return String(s ?? "")
             .replace(/\s+/g, " ")
             .trim();
         }
 
+        function getRoot(rootInfo) {
+          const btn =
+            document.querySelector('[data-component="product.add-to-cart"]') ||
+            document.querySelector("input.product-buy-btn") ||
+            document.querySelector("button.product-buy-btn");
+
+          if (rootInfo?.mode === "form" && btn)
+            return btn.closest("form") || document;
+          if (rootInfo?.mode === "wrap" && btn)
+            return (
+              btn.closest(
+                ".product-form, .js-product-form, .product-detail, .product-container"
+              ) || document
+            );
+          return document;
+        }
+
+        const root = getRoot(rootInfo);
+
         const groups = {};
-        const elems = Array.from(
-          document.querySelectorAll('[name^="variation["]')
-        );
+        const elems = Array.from(root.querySelectorAll('[name^="variation["]'));
 
         for (const el of elems) {
           const name = el.getAttribute("name") || "";
           if (!name) continue;
 
-          // ignorar inputs hidden
           const type = (el.getAttribute("type") || "").toLowerCase();
           if (type === "hidden") continue;
 
@@ -118,7 +143,7 @@ app.post("/check-variants", async (req, res) => {
           ) {
             groups[name].kind = "radio";
             const radios = Array.from(
-              document.querySelectorAll(`input[name="${CSS.escape(name)}"]`)
+              root.querySelectorAll(`input[name="${CSS.escape(name)}"]`)
             );
             groups[name].options = radios.map((r) => ({
               value: norm(r.getAttribute("value") || ""),
@@ -138,219 +163,191 @@ app.post("/check-variants", async (req, res) => {
         });
 
         return list;
+      },
+      { rootInfo }
+    );
+
+    // ===== 2) setVariation SOLO dentro del root =====
+    async function setVariation(name, value) {
+      await page.evaluate(
+        ({ name, value, rootInfo }) => {
+          function getRoot(rootInfo) {
+            const btn =
+              document.querySelector(
+                '[data-component="product.add-to-cart"]'
+              ) ||
+              document.querySelector("input.product-buy-btn") ||
+              document.querySelector("button.product-buy-btn");
+
+            if (rootInfo?.mode === "form" && btn)
+              return btn.closest("form") || document;
+            if (rootInfo?.mode === "wrap" && btn)
+              return (
+                btn.closest(
+                  ".product-form, .js-product-form, .product-detail, .product-container"
+                ) || document
+              );
+            return document;
+          }
+
+          const root = getRoot(rootInfo);
+
+          const sel = root.querySelector(`select[name="${CSS.escape(name)}"]`);
+          if (sel) {
+            sel.value = value;
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+            return;
+          }
+
+          const radio = root.querySelector(
+            `input[name="${CSS.escape(name)}"][value="${CSS.escape(value)}"]`
+          );
+          if (radio) {
+            radio.click();
+            radio.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        },
+        { name, value, rootInfo }
+      );
+    }
+
+    // ===== 3) disponibilidad mirando SOLO el botón principal =====
+    async function readAvailable() {
+      return await page.evaluate(() => {
+        const btn =
+          document.querySelector('[data-component="product.add-to-cart"]') ||
+          document.querySelector("input.product-buy-btn") ||
+          document.querySelector("button.product-buy-btn");
+
+        if (!btn) return null;
+
+        const disabled =
+          (btn instanceof HTMLInputElement ||
+            btn instanceof HTMLButtonElement) &&
+          btn.disabled === true;
+
+        const cls = (btn.getAttribute("class") || "").toLowerCase();
+        const val =
+          btn instanceof HTMLInputElement
+            ? btn.value || ""
+            : btn.textContent || "";
+        const text = String(val).toLowerCase();
+
+        const noStock =
+          disabled ||
+          cls.includes("nostock") ||
+          text.includes("sin stock") ||
+          text.includes("agotado");
+
+        return !noStock;
+      });
+    }
+
+    // ===== 4) combos =====
+    const combos = [];
+
+    // sin variaciones: 1 “combo”
+    if (!variations.length) {
+      const available = await readAvailable();
+      combos.push({
+        talle: "(sin talle)",
+        color: fallbackColor || "(sin color)",
+        available: available === true,
       });
 
-      const fallbackColor = colorFromUrl(product_url);
+      return res.json({
+        product_url,
+        combos,
+        combosCount: combos.length,
+        tallesCount: 0,
+        coloresCount: 0,
+        limited: false,
+        max_combos,
+        max_ms,
+        elapsed_ms: nowMs() - jobStarted,
+      });
+    }
 
-      // ===== 2) Setear variación (sin exigir visible) =====
-      async function setVariation(name, value) {
-        await page.evaluate(
-          ({ name, value }) => {
-            const sel = document.querySelector(
-              `select[name="${CSS.escape(name)}"]`
-            );
-            if (sel) {
-              sel.value = value;
-              sel.dispatchEvent(new Event("change", { bubbles: true }));
-              return;
-            }
-            const radio = document.querySelector(
-              `input[name="${CSS.escape(name)}"][value="${CSS.escape(value)}"]`
-            );
-            if (radio) {
-              radio.click();
-              radio.dispatchEvent(new Event("change", { bubbles: true }));
-            }
-          },
-          { name, value }
-        );
-      }
+    // regla actual: [0]=talle [1]=color (si existe)
+    const v0 = variations[0];
+    const v1 = variations[1] || null;
 
-      // ===== 3) Leer disponibilidad por botón =====
-      async function readAvailable() {
-        return await page.evaluate(() => {
-          const btn =
-            document.querySelector("input.product-buy-btn") ||
-            document.querySelector("button.product-buy-btn") ||
-            document.querySelector('[data-component="product.add-to-cart"]');
+    const talles = (v0?.options || []).filter((o) => !o.disabled);
+    const colores = v1 ? (v1.options || []).filter((o) => !o.disabled) : [];
 
-          if (!btn) return null;
+    const tallesCount = talles.length;
+    const coloresCount = v1 ? colores.length : 0;
 
-          const disabled =
-            (btn instanceof HTMLInputElement ||
-              btn instanceof HTMLButtonElement) &&
-            btn.disabled === true;
+    for (const t of talles) {
+      if (nowMs() > deadline) break;
 
-          const cls = (btn.getAttribute("class") || "").toLowerCase();
-          const val =
-            btn instanceof HTMLInputElement
-              ? btn.value || ""
-              : btn.textContent || "";
-          const text = String(val).toLowerCase();
+      await setVariation(v0.name, t.value);
+      await page.waitForTimeout(40);
 
-          const noStock =
-            disabled ||
-            cls.includes("nostock") ||
-            text.includes("sin stock") ||
-            text.includes("agotado");
-
-          return !noStock;
-        });
-      }
-
-      // ===== 4) Armar combos =====
-      const combos = [];
-      const deadline = started + max_ms;
-
-      // Caso: sin variaciones -> 1 “combo”
-      if (!variations.length) {
+      // solo talle (sin color)
+      if (!v1) {
         const available = await readAvailable();
         combos.push({
-          talle: "(sin talle)",
+          talle: t.label || t.value,
           color: fallbackColor || "(sin color)",
           available: available === true,
         });
-
-        return {
-          status: 200,
-          body: {
-            product_url,
-            combos,
-            combosCount: combos.length,
-            tallesCount: 0,
-            coloresCount: 0,
-            limited: false,
-            max_combos,
-            max_ms,
-            elapsed_ms: nowMs() - started,
-          },
-        };
+        if (combos.length >= max_combos) break;
+        continue;
       }
 
-      // Tomamos:
-      // variation[0] = talle
-      // variation[1] = color (si existe)
-      const v0 = variations[0];
-      const v1 = variations[1] || null;
-
-      const talles = (v0?.options || []).filter((o) => !o.disabled);
-      const colores = v1 ? (v1.options || []).filter((o) => !o.disabled) : [];
-
-      const tallesCount = talles.length;
-      const coloresCount = v1 ? colores.length : 0;
-
-      for (const t of talles) {
+      // talle + color
+      for (const c of colores) {
         if (nowMs() > deadline) break;
 
-        await setVariation(v0.name, t.value);
-        await page.waitForTimeout(120);
+        await setVariation(v1.name, c.value);
+        await page.waitForTimeout(40);
 
-        if (!v1) {
-          const available = await readAvailable();
-          combos.push({
-            talle: t.label || t.value,
-            color: fallbackColor || "(sin color)",
-            available: available === true,
-          });
-          if (combos.length >= max_combos) break;
-          continue;
-        }
+        const available = await readAvailable();
 
-        for (const c of colores) {
-          if (nowMs() > deadline) break;
-
-          await setVariation(v1.name, c.value);
-          await page.waitForTimeout(120);
-
-          const available = await readAvailable();
-
-          combos.push({
-            talle: t.label || t.value,
-            color: c.label || c.value,
-            available: available === true,
-          });
-
-          if (combos.length >= max_combos) break;
-        }
+        combos.push({
+          talle: t.label || t.value,
+          color: c.label || c.value,
+          available: available === true,
+        });
 
         if (combos.length >= max_combos) break;
       }
 
-      const limited = combos.length >= max_combos || nowMs() > deadline;
-
-      return {
-        status: 200,
-        body: {
-          product_url,
-          combos,
-          combosCount: combos.length,
-          tallesCount,
-          coloresCount,
-          limited,
-          max_combos,
-          max_ms,
-          elapsed_ms: nowMs() - started,
-        },
-      };
-    } catch (err) {
-      return {
-        status: 500,
-        body: {
-          error: String(err?.message || err),
-          elapsed_ms: nowMs() - started,
-        },
-      };
-    } finally {
-      // cerrar SIEMPRE
-      try {
-        if (page) await page.close();
-      } catch {}
-      try {
-        if (context) await context.close();
-      } catch {}
-      try {
-        if (browser) await browser.close();
-      } catch {}
+      if (combos.length >= max_combos) break;
     }
-  };
 
-  // ---- ENCOLAR (1 por vez) ----
-  queued += 1;
+    const limited = combos.length >= max_combos || nowMs() > deadline;
 
-  const run = () =>
-    withTimeout(
-      (async () => {
-        queued -= 1;
-        running = true;
-        try {
-          return await job();
-        } finally {
-          running = false;
-        }
-      })(),
-      // timeout global hard para que n8n no quede colgado infinito
-      Math.max(30000, max_ms + 30000),
-      "request"
-    );
-
-  const p = queue.then(run, run);
-
-  // mantener la cola viva aunque falle
-  queue = p.catch(() => {});
-
-  try {
-    const out = await p;
-    return res.status(out.status).json(out.body);
-  } catch (e) {
+    return res.json({
+      product_url,
+      combos,
+      combosCount: combos.length,
+      tallesCount,
+      coloresCount,
+      limited,
+      max_combos,
+      max_ms,
+      elapsed_ms: nowMs() - jobStarted,
+    });
+  } catch (err) {
     return res.status(500).json({
-      error: String(e?.message || e),
+      product_url,
+      error: String(err?.message || err),
       elapsed_ms: nowMs() - started,
     });
+  } finally {
+    try {
+      if (page) await page.close();
+    } catch {}
+    try {
+      if (context) await context.close();
+    } catch {}
+    try {
+      if (browser) await browser.close();
+    } catch {}
   }
 });
 
-// Railway usa PORT
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-app.listen(PORT, () => {
-  console.log(`OK on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`OK on port ${PORT}`));
