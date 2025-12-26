@@ -46,7 +46,9 @@ function nowMs() {
 }
 
 function normalizeText(s) {
-  return String(s ?? "").replace(/\s+/g, " ").trim();
+  return String(s ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function isFatalPlaywrightError(msg) {
@@ -146,7 +148,9 @@ function queueStats() {
     worker_running: workerRunning,
     jobs_done: jobsDone,
     browser_up: !!browser,
-    last_browser_start_ms_ago: lastBrowserStart ? nowMs() - lastBrowserStart : null,
+    last_browser_start_ms_ago: lastBrowserStart
+      ? nowMs() - lastBrowserStart
+      : null,
   };
 }
 
@@ -218,28 +222,25 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
 
     // ===== 1) detectar variaciones del DOM (SOLO VISIBLES) =====
     const variations = await page.evaluate(() => {
-      const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+      const norm = (s) =>
+        String(s ?? "")
+          .replace(/\s+/g, " ")
+          .trim();
 
-      function isVisible(el) {
-        if (!el) return false;
-        const st = window.getComputedStyle(el);
-        if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") return false;
-        const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      }
+      // intentamos encerrar el scope al form real de compra
+      const form =
+        document.querySelector('form[action*="/cart"]') ||
+        document.querySelector('form[action*="carrito"]') ||
+        document.querySelector("form.product-form") ||
+        document
+          .querySelector('[data-component="product.add-to-cart"]')
+          ?.closest("form") ||
+        document.querySelector("form");
 
-      function labelForInput(input) {
-        const id = input.getAttribute("id");
-        if (id) {
-          const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-          if (lab) return lab;
-        }
-        const closest = input.closest("label");
-        return closest || null;
-      }
+      const scope = form || document;
 
       const groups = {};
-      const elems = Array.from(document.querySelectorAll('[name^="variation["]'));
+      const elems = Array.from(scope.querySelectorAll('[name^="variation["]'));
 
       for (const el of elems) {
         const name = el.getAttribute("name") || "";
@@ -250,63 +251,46 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
 
         if (type === "hidden") continue;
 
-        // solo soportamos select y radio/checkbox
+        groups[name] ??= { name, kind: "", options: [] };
+
         if (tag === "select") {
-          if (!isVisible(el)) continue;
-          groups[name] ??= { name, kind: "select", options: [] };
+          groups[name].kind = "select";
           const opts = Array.from(el.querySelectorAll("option")).map((o) => ({
             value: norm(o.getAttribute("value") || ""),
             label: norm(o.textContent),
             disabled: !!o.disabled,
           }));
-          groups[name].options = opts.filter((o) => o.value !== "" && !o.disabled);
-          continue;
-        }
-
-        if (tag === "input" && (type === "radio" || type === "checkbox")) {
-          const lab = labelForInput(el);
-          const visible = isVisible(el) || isVisible(lab);
-          if (!visible) continue;
-
-          groups[name] ??= { name, kind: "radio", options: [] };
-
+          groups[name].options = opts.filter(
+            (o) => o.value !== "" && !o.disabled
+          );
+        } else if (
+          tag === "input" &&
+          (type === "radio" || type === "checkbox")
+        ) {
+          groups[name].kind = "radio";
           const radios = Array.from(
-            document.querySelectorAll(`input[name="${CSS.escape(name)}"]`)
-          ).filter((r) => {
-            const t = (r.getAttribute("type") || "").toLowerCase();
-            if (t !== "radio" && t !== "checkbox") return false;
-            const lb = labelForInput(r);
-            const vis = isVisible(r) || isVisible(lb);
-            return vis && !r.disabled;
-          });
-
+            scope.querySelectorAll(`input[name="${CSS.escape(name)}"]`)
+          );
           const mapped = radios.map((r) => ({
             value: norm(r.getAttribute("value") || ""),
             label:
               norm(r.getAttribute("aria-label")) ||
               norm(r.getAttribute("title")) ||
-              norm(labelForInput(r)?.textContent) ||
               norm(r.value),
             disabled: !!r.disabled,
           }));
-
-          // únicos por value|label para evitar repetidos
-          const unique = [];
+          // únicos y no disabled
           const seen = new Set();
-          for (const o of mapped) {
-            if (!o.value) continue;
+          groups[name].options = mapped.filter((o) => {
+            if (!o.value || o.disabled) return false;
             const k = `${o.value}||${o.label}`;
-            if (seen.has(k)) continue;
+            if (seen.has(k)) return false;
             seen.add(k);
-            unique.push(o);
-          }
-
-          groups[name].options = unique;
-          continue;
+            return true;
+          });
         }
       }
 
-      // ordenar por índice variation[n]
       return Object.values(groups).sort((a, b) => {
         const ia = parseInt((a.name.match(/\[(\d+)\]/) || [])[1] || "0", 10);
         const ib = parseInt((b.name.match(/\[(\d+)\]/) || [])[1] || "0", 10);
@@ -319,7 +303,9 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
     async function setVariation(name, value) {
       await page.evaluate(
         ({ name, value }) => {
-          const sel = document.querySelector(`select[name="${CSS.escape(name)}"]`);
+          const sel = document.querySelector(
+            `select[name="${CSS.escape(name)}"]`
+          );
           if (sel) {
             sel.value = value;
             sel.dispatchEvent(new Event("change", { bubbles: true }));
@@ -348,12 +334,15 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
         if (!btn) return null;
 
         const disabled =
-          (btn instanceof HTMLInputElement || btn instanceof HTMLButtonElement) &&
+          (btn instanceof HTMLInputElement ||
+            btn instanceof HTMLButtonElement) &&
           btn.disabled === true;
 
         const cls = (btn.getAttribute("class") || "").toLowerCase();
         const val =
-          btn instanceof HTMLInputElement ? btn.value || "" : btn.textContent || "";
+          btn instanceof HTMLInputElement
+            ? btn.value || ""
+            : btn.textContent || "";
         const text = String(val).toLowerCase();
 
         const noStock =
@@ -395,7 +384,9 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
     const vars = variations
       .map((v) => ({
         name: v.name,
-        options: Array.isArray(v.options) ? v.options.filter((o) => !o.disabled) : [],
+        options: Array.isArray(v.options)
+          ? v.options.filter((o) => !o.disabled)
+          : [],
       }))
       .filter((v) => v.options.length > 0);
 
