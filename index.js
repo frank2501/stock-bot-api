@@ -237,4 +237,10 @@ app.get("/health", (_req, res) => {
 });
 
 
-app.listen(PORT, () => ensureBrowser());
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+  ensureBrowser().catch(err =>
+    console.error("Browser warmup failed:", err)
+  );
+});
+
