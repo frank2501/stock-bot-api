@@ -218,5 +218,23 @@ app.post("/check-variants", async (req, res) => {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "stock-bot-api",
+    routes: ["GET /health", "POST /check-variants"],
+  });
+});
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    queue_len: queue.length,
+    worker_running: workerRunning,
+    jobs_done: jobsDone,
+    browser_up: !!browser,
+  });
+});
+
 
 app.listen(PORT, () => ensureBrowser());
