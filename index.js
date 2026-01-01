@@ -60,12 +60,98 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function colorFromUrl(product_url) {
-  // ej: /productos/art-4315-malbec/ -> "malbec"
-  const slug = (product_url.split("/productos/")[1] || "").split("/")[0] || "";
-  const parts = slug.split("-");
-  if (parts.length < 2) return "";
-  return parts[parts.length - 1].replace(/_/g, " ").trim();
+/**
+ * NUEVO: slug y color “inteligente”
+ * - toma todo lo que está después de ART-#### (o ART. ####)
+ * - ignora un sufijo tipo código (bpofg / uafvv / t352x, etc)
+ */
+function productSlugFromUrl(product_url) {
+  const after = (product_url.split("/productos/")[1] || "").split("/")[0] || "";
+  return after.trim();
+}
+
+function looksLikeCodeToken(tok) {
+  // ejemplos reales: bpofg, uafvv, t352x, chicle? (chicle NO es código)
+  // regla: 4-6 chars alfanum, y que NO sea una palabra “normal” con vocales claras
+  const t = String(tok || "").toLowerCase().trim();
+  if (!/^[a-z0-9]{4,6}$/.test(t)) return false;
+  // si tiene al menos 2 vocales, probablemente es palabra/color (chicle, aqua) -> no lo mates
+  const vowels = (t.match(/[aeiou]/g) || []).length;
+  if (vowels >= 2) return false;
+  return true;
+}
+
+function cleanColorText(s) {
+  return normalizeText(String(s || "").replace(/_/g, " ").replace(/-/g, " "));
+}
+
+function colorFromUrlSmart(product_url) {
+  const slug = productSlugFromUrl(product_url);
+  if (!slug) return "";
+
+  const parts = slug.split("-").filter(Boolean).map((x) => x.trim());
+  if (!parts.length) return "";
+
+  // encontrar “art” + número (art 4315)
+  let i = 0;
+  if (parts[0].toLowerCase() === "art" || parts[0].toLowerCase() === "art.") i = 1;
+  if (i < parts.length && /^\d+$/.test(parts[i])) i += 1;
+
+  // si no matcheó el patrón, igual intentamos: buscar primer número y cortar ahí
+  if (i === 0) {
+    const idxNum = parts.findIndex((p) => /^\d+$/.test(p));
+    if (idxNum >= 0) i = idxNum + 1;
+  }
+
+  let colorParts = parts.slice(i);
+  if (!colorParts.length) return "";
+
+  // sacar sufijo tipo código (bpofg/uafvv/t352x/etc)
+  const last = colorParts[colorParts.length - 1];
+  if (looksLikeCodeToken(last)) {
+    colorParts = colorParts.slice(0, -1);
+  }
+
+  // caso borde: si quedó vacío, devolvemos el último “no código”
+  if (!colorParts.length) return "";
+
+  return cleanColorText(colorParts.join(" "));
+}
+
+/**
+ * Heurística para detectar “talle”
+ * (T1/T2..., S/M/L/XL..., 85/90..., 36/38..., etc)
+ */
+function isLikelySizeLabel(label) {
+  const s = String(label || "").toLowerCase().trim();
+
+  // t1, t2, t3...
+  if (/\bt\s*\d+\b/.test(s)) return true;
+
+  // xs/s/m/l/xl/xxl/xxxl
+  if (/\b(xxs|xs|s|m|l|xl|xxl|xxxl)\b/.test(s)) return true;
+
+  // números típicos de talle (ropa / corpiño / jean)
+  if (/^\d{1,3}$/.test(s)) return true; // 85, 90, 95, 36, 38...
+  if (/\b(34|35|36|37|38|39|40|41|42|43|44|45|46|47|48|49|50)\b/.test(s))
+    return true;
+
+  // “único”
+  if (/\b(único|unico|unique|one size|talle unico)\b/.test(s)) return true;
+
+  return false;
+}
+
+function talleScoreForGroup(group) {
+  const opts = Array.isArray(group?.options) ? group.options : [];
+  if (!opts.length) return 0;
+
+  let hits = 0;
+  for (const o of opts) {
+    const lbl = o.label || o.value || "";
+    if (isLikelySizeLabel(lbl)) hits++;
+  }
+  return hits / opts.length; // 0..1
 }
 
 function uniqBy(arr, keyFn) {
@@ -111,7 +197,6 @@ async function ensureBrowser() {
     } catch (err) {
       const msg = String(err?.message || err);
       console.error("Failed to launch browser:", msg);
-      // si no podemos lanzar, matamos proceso -> Railway restart
       setTimeout(() => process.exit(1), 200);
       throw err;
     } finally {
@@ -128,7 +213,6 @@ async function restartBrowser(reason = "unknown") {
     if (browser) await browser.close();
   } catch {}
   browser = null;
-  // backoff mínimo
   await sleep(250);
   await ensureBrowser();
 }
@@ -148,9 +232,7 @@ function queueStats() {
     worker_running: workerRunning,
     jobs_done: jobsDone,
     browser_up: !!browser,
-    last_browser_start_ms_ago: lastBrowserStart
-      ? nowMs() - lastBrowserStart
-      : null,
+    last_browser_start_ms_ago: lastBrowserStart ? nowMs() - lastBrowserStart : null,
   };
 }
 
@@ -174,7 +256,6 @@ async function runWorker() {
 
   try {
     while (queue.length) {
-      // restart preventivo cada N jobs
       if (browser && jobsDone > 0 && jobsDone % RESTART_EVERY_JOBS === 0) {
         await restartBrowser("preventive_restart");
       }
@@ -220,6 +301,37 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
 
     await page.goto(product_url, { waitUntil: "domcontentloaded" });
 
+    // NUEVO: sacar title (para fallback de color si no hay variación de color)
+    const pageTitle = await page.evaluate(() => {
+      const h1 =
+        document.querySelector("h1.product-name") ||
+        document.querySelector("h1[itemprop='name']") ||
+        document.querySelector("h1") ||
+        null;
+      return h1 ? String(h1.textContent || "").trim() : "";
+    });
+
+    function colorFromTitleSmart(title) {
+      const t = String(title || "").replace(/\s+/g, " ").trim();
+      if (!t) return "";
+
+      // ejemplo: "ART. 4315 - LILA Y ROSA CHICLE"
+      const partsDash = t.split(" - ").map((x) => x.trim()).filter(Boolean);
+      if (partsDash.length >= 2) {
+        // todo lo que va después del primer " - "
+        return cleanColorText(partsDash.slice(1).join(" - "));
+      }
+
+      // fallback: si hay "art" y número, tomar lo que sigue
+      const m = t.match(/art\.?\s*\d+\s*(.*)$/i);
+      if (m && m[1]) return cleanColorText(m[1]);
+
+      return "";
+    }
+
+    const fallbackColor =
+      colorFromTitleSmart(pageTitle) || colorFromUrlSmart(product_url);
+
     // ===== 1) detectar variaciones del DOM (SOLO VISIBLES) =====
     const variations = await page.evaluate(() => {
       const norm = (s) =>
@@ -227,7 +339,6 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
           .replace(/\s+/g, " ")
           .trim();
 
-      // intentamos encerrar el scope al form real de compra
       const form =
         document.querySelector('form[action*="/cart"]') ||
         document.querySelector('form[action*="carrito"]') ||
@@ -260,13 +371,8 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
             label: norm(o.textContent),
             disabled: !!o.disabled,
           }));
-          groups[name].options = opts.filter(
-            (o) => o.value !== "" && !o.disabled
-          );
-        } else if (
-          tag === "input" &&
-          (type === "radio" || type === "checkbox")
-        ) {
+          groups[name].options = opts.filter((o) => o.value !== "" && !o.disabled);
+        } else if (tag === "input" && (type === "radio" || type === "checkbox")) {
           groups[name].kind = "radio";
           const radios = Array.from(
             scope.querySelectorAll(`input[name="${CSS.escape(name)}"]`)
@@ -279,7 +385,6 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
               norm(r.value),
             disabled: !!r.disabled,
           }));
-          // únicos y no disabled
           const seen = new Set();
           groups[name].options = mapped.filter((o) => {
             if (!o.value || o.disabled) return false;
@@ -298,14 +403,10 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
       });
     });
 
-    const fallbackColor = colorFromUrl(product_url);
-
     async function setVariation(name, value) {
       await page.evaluate(
         ({ name, value }) => {
-          const sel = document.querySelector(
-            `select[name="${CSS.escape(name)}"]`
-          );
+          const sel = document.querySelector(`select[name="${CSS.escape(name)}"]`);
           if (sel) {
             sel.value = value;
             sel.dispatchEvent(new Event("change", { bubbles: true }));
@@ -323,7 +424,6 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
       );
     }
 
-    // disponibilidad basada en botón “Sin stock”
     async function readAvailable() {
       return await page.evaluate(() => {
         const btn =
@@ -334,15 +434,12 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
         if (!btn) return null;
 
         const disabled =
-          (btn instanceof HTMLInputElement ||
-            btn instanceof HTMLButtonElement) &&
+          (btn instanceof HTMLInputElement || btn instanceof HTMLButtonElement) &&
           btn.disabled === true;
 
         const cls = (btn.getAttribute("class") || "").toLowerCase();
         const val =
-          btn instanceof HTMLInputElement
-            ? btn.value || ""
-            : btn.textContent || "";
+          btn instanceof HTMLInputElement ? btn.value || "" : btn.textContent || "";
         const text = String(val).toLowerCase();
 
         const noStock =
@@ -380,17 +477,14 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
       };
     }
 
-    // ---------- NUEVO: soportar N variaciones ----------
+    // ---------- soportar N variaciones ----------
     const vars = variations
       .map((v) => ({
         name: v.name,
-        options: Array.isArray(v.options)
-          ? v.options.filter((o) => !o.disabled)
-          : [],
+        options: Array.isArray(v.options) ? v.options.filter((o) => !o.disabled) : [],
       }))
       .filter((v) => v.options.length > 0);
 
-    // Si por visibilidad filtramos todo, caemos a “sin variaciones”
     if (!vars.length) {
       const available = await readAvailable();
       combos.push({
@@ -413,16 +507,36 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
       };
     }
 
-    // Para compat con n8n:
-    // - talle = opción elegida del primer grupo
-    // - color = concatenación de los demás grupos (si no hay, fallback)
-    const talleVar = vars[0];
-    const otherVars = vars.slice(1);
+    /**
+     * NUEVO: elegir “talleVar” por score (arregla color/talle invertidos)
+     * - si algún grupo tiene score >= 0.6 lo tomamos como talle
+     * - si no, agarramos el de mayor score
+     * - si todos empatan en 0, queda el primero (como antes)
+     */
+    const scored = vars.map((v, idx) => ({
+      idx,
+      v,
+      score: talleScoreForGroup(v),
+    }));
+
+    scored.sort((a, b) => b.score - a.score);
+
+    let tallePick = scored[0]; // best
+    // si el best es muy bajo, volvemos al comportamiento original (primer grupo)
+    if ((tallePick?.score ?? 0) < 0.2) {
+      tallePick = { idx: 0, v: vars[0], score: 0 };
+    }
+
+    const talleVar = tallePick.v;
+
+    // mantener orden original para el resto
+    const otherVars = vars.filter((x) => x.name !== talleVar.name);
 
     const talles = talleVar.options;
-    const coloresCountCompat = vars[1]?.options?.length ?? 0;
 
-    // Generar combinaciones de "otros" (cartesiano), con cap max_combos
+    // “coloresCount” compat: cantidad de opciones del primer “otro” grupo
+    const coloresCountCompat = otherVars[0]?.options?.length ?? 0;
+
     function buildOtherCombos() {
       if (!otherVars.length) return [[]];
 
@@ -450,7 +564,6 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
       await setVariation(talleVar.name, t.value);
       await page.waitForTimeout(UI_TICK_MS);
 
-      // sin otros grupos -> una sola combinación por talle
       if (!otherVars.length) {
         const available = await readAvailable();
         combos.push({
@@ -465,7 +578,6 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
       for (const parts of otherCombos) {
         if (nowMs() > deadline) break;
 
-        // setear todas las variaciones restantes (en orden)
         for (const p of parts) {
           await setVariation(p.varName, p.opt.value);
           await page.waitForTimeout(UI_TICK_MS);
@@ -498,7 +610,6 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
       combos,
       combosCount: combos.length,
       tallesCount: talles.length,
-      // compat: antes era "cantidad de colores" (segunda variación)
       coloresCount: coloresCountCompat,
       limited,
       max_combos,
@@ -508,7 +619,6 @@ async function scrapeProduct({ product_url, max_combos, max_ms }) {
   } catch (err) {
     const msg = String(err?.message || err);
 
-    // si se rompió el browser / target cerrado / etc, reiniciamos browser para próximos jobs
     if (isFatalPlaywrightError(msg)) {
       await restartBrowser(msg);
     }
@@ -557,7 +667,6 @@ app.post("/check-variants", async (req, res) => {
   } catch (err) {
     const msg = String(err?.message || err);
 
-    // cola llena
     if (err?.status === 429 || msg === "queue_full") {
       return res.status(429).json({
         error: "busy",
@@ -567,7 +676,6 @@ app.post("/check-variants", async (req, res) => {
       });
     }
 
-    // si es fatal y sigue pasando, matamos el proceso para que Railway lo reinicie “limpio”
     if (isFatalPlaywrightError(msg)) {
       console.error("FATAL (request) -> restart process:", msg);
       setTimeout(() => process.exit(1), 200);
@@ -598,6 +706,5 @@ process.on("SIGINT", shutdown);
 
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
-  // warm-up browser (opcional, acelera primer request)
   ensureBrowser().catch(() => {});
 });
